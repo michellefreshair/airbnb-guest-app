@@ -1,0 +1,122 @@
+import streamlit as st
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+import datetime
+import json
+
+# Set up page configuration
+st.set_page_config(page_title="Airbnb Guest Assistant", layout="wide")
+
+# --- DATABASE SETUP ---
+@st.cache_resource
+def get_gspread_client():
+    # Read secrets from Streamlit
+    creds_dict = json.loads(st.secrets["gcp_service_account"])
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    return client
+
+# --- SIMPLE USER AUTHENTICATION ---
+USERS = {
+    "admin": {"password": "adminpassword123", "role": "Admin"},
+    "manager1": {"password": "mypassword123", "role": "Manager"},
+}
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.username = ""
+    st.session_state.role = ""
+
+def login_page():
+    st.title("🔒 Airbnb Assistant Login")
+    user = st.text_input("Username")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Log In"):
+        if user in USERS and USERS[user]["password"] == pwd:
+            st.session_state.logged_in = True
+            st.session_state.username = user
+            st.session_state.role = USERS[user]["role"]
+            st.rerun()
+        else:
+            st.error("Invalid Username or Password")
+
+if not st.session_state.logged_in:
+    login_page()
+    st.stop()
+
+# --- MAIN APP ONCE LOGGED IN ---
+st.sidebar.title(f"👋 Welcome, {st.session_state.username}!")
+if st.sidebar.button("Log Out"):
+    st.session_state.logged_in = False
+    st.rerun()
+
+st.title("🏨 Airbnb Guest Response Assistant")
+
+sheet_name = st.text_input("Google Sheet Title", "Airbnb Property Info")
+
+try:
+    gc = get_gspread_client()
+    sh = gc.open(sheet_name)
+    prop_sheet = sh.worksheet("Property Info")
+    log_sheet = sh.worksheet("Message Logs")
+
+    # Load Property Data
+    properties_df = pd.DataFrame(prop_sheet.get_all_records())
+    property_list = properties_df['Property Name'].tolist() if not properties_df.empty else []
+
+    tab1, tab2 = st.tabs(["✍️ Draft Response", "📋 View & Manage Logs"])
+
+    with tab1:
+        st.subheader("New Guest Inquiry")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            guest_name = st.text_input("Guest Name")
+        with col2:
+            selected_property = st.selectbox("Select Property", property_list)
+        with col3:
+            booking_dates = st.text_input("Booking Dates (e.g., Oct 20-25)")
+
+        guest_message = st.text_area("Paste Guest Message/Inquiry Here")
+        manager_notes = st.text_area("Paste Manager/Owner Notes Here")
+
+        # Context Fetching
+        prop_info = properties_df[properties_df['Property Name'] == selected_property] if selected_property else pd.DataFrame()
+
+        if st.button("Generate Draft Response"):
+            # Template Builder
+            wifi = prop_info['WiFi Password'].values[0] if not prop_info.empty and 'WiFi Password' in prop_info else 'N/A'
+            checkin = prop_info['Check-in Time'].values[0] if not prop_info.empty and 'Check-in Time' in prop_info else 'N/A'
+            
+            draft = f"Hi {guest_name}!\n\nThank you for reaching out. Regarding your stay ({booking_dates}):\n\n"
+            if manager_notes:
+                draft += f"Notes: {manager_notes}\n\n"
+            draft += f"Standard Check-in time is {checkin}. WiFi Password: {wifi}.\n\nBest regards,\nYour Hosting Team"
+            
+            st.session_state.current_draft = draft
+
+        if "current_draft" in st.session_state:
+            final_draft = st.text_area("Review & Edit Draft Response", st.session_state.current_draft, height=200)
+            
+            status = st.selectbox("Mark Entry Status", ["Draft", "Resolved", "Pending Follow-up", "Endorsed"])
+            assigned_to = st.selectbox("Assign/Endorse To", list(USERS.keys()))
+
+            if st.button("Save & Log Entry"):
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                entry_id = f"MSG-{int(datetime.datetime.now().timestamp())}"
+                
+                log_sheet.append_row([
+                    entry_id, timestamp, guest_name, selected_property, booking_dates,
+                    guest_message, manager_notes, final_draft, status, assigned_to, st.session_state.username
+                ])
+                st.success("Entry saved successfully to Google Sheets!")
+
+    with tab2:
+        st.subheader("Previous Message Logs")
+        logs_df = pd.DataFrame(log_sheet.get_all_records())
+        st.dataframe(logs_df, use_container_width=True)
+
+except Exception as e:
+    st.error(f"Error connecting to Google Sheets: {e}")
+    st.info("Make sure you shared the sheet with the Service Account email and entered the sheet title correctly!")
